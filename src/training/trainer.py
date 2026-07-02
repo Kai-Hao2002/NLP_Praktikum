@@ -613,6 +613,10 @@ def train_model_curriculum(
         if checkpoint_interval_tokens is not None
         else None
     )
+    checkpoint_schedule = config.get("checkpoint_schedule", "official")
+    checkpoint_interval_for_schedule = (
+        None if checkpoint_schedule == "official" else checkpoint_interval_tokens
+    )
     save_intermediate_checkpoints = bool(
         config.get("save_intermediate_checkpoints", True)
     )
@@ -655,6 +659,12 @@ def train_model_curriculum(
     optimizer = AdamW(model.parameters(), lr=learning_rate)
 
     tracker = TokenExposureTracker()
+    next_checkpoint_target = None
+    if save_intermediate_checkpoints:
+        next_checkpoint_target = get_next_checkpoint_target(
+            tracker.adjusted_seen_tokens_total,
+            checkpoint_interval_for_schedule,
+        )
     global_step = 0
     micro_step = 0
     accumulated_micro_steps = 0
@@ -737,7 +747,7 @@ def train_model_curriculum(
                     )
 
             checkpoint_path = ""
-            if checkpoint_name == "final_model" or save_intermediate_checkpoints:
+            if checkpoint_name == "final_model":
                 checkpoint_path = save_checkpoint(
                     model=model,
                     tokenizer=tokenizer,
@@ -781,6 +791,73 @@ def train_model_curriculum(
             f.flush()
             return checkpoint_path
 
+        def save_curriculum_milestone_checkpoint(checkpoint_target):
+            checkpoint_name = format_checkpoint_name(checkpoint_target)
+            checkpoint_path = save_checkpoint(
+                model=model,
+                tokenizer=tokenizer,
+                output_dir=output_dir,
+                checkpoint_name=checkpoint_name,
+            )
+            logger.info(
+                f"Saved curriculum checkpoint at adjusted token target "
+                f"{checkpoint_target:,}: {checkpoint_path}"
+            )
+            return checkpoint_path
+
+        def write_curriculum_milestone_checkpoint_row(
+            checkpoint_target,
+            epoch,
+            stage_name,
+            stage_step,
+            micro_train_loss,
+            update_train_loss_avg,
+            target_adjusted_tokens,
+        ):
+            checkpoint_path = save_curriculum_milestone_checkpoint(
+                checkpoint_target
+            )
+            formatted_update_train_loss_avg = (
+                f"{update_train_loss_avg:.6f}"
+                if update_train_loss_avg != ""
+                else ""
+            )
+            writer.writerow({
+                "epoch": epoch,
+                "stage": stage_name,
+                "global_step": global_step,
+                "stage_step": stage_step,
+                "micro_step": micro_step,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
+                "effective_tokens_per_update": effective_tokens_per_update,
+                "train_loss": formatted_update_train_loss_avg,
+                "micro_train_loss": (
+                    f"{micro_train_loss:.6f}"
+                    if micro_train_loss is not None
+                    else ""
+                ),
+                "update_train_loss_avg": formatted_update_train_loss_avg,
+                "validation_loss": "",
+                "perplexity": "",
+                "train_validation_gap": "",
+                "raw_seen_tokens_total": tracker.raw_seen_tokens_total,
+                "raw_seen_tokens_eng": tracker.raw_seen_tokens_eng,
+                "raw_seen_tokens_nld": tracker.raw_seen_tokens_nld,
+                "raw_seen_tokens_zho": tracker.raw_seen_tokens_zho,
+                "adjusted_seen_tokens_eng": f"{tracker.adjusted_seen_tokens_eng:.2f}",
+                "adjusted_seen_tokens_nld": f"{tracker.adjusted_seen_tokens_nld:.2f}",
+                "adjusted_seen_tokens_zho": f"{tracker.adjusted_seen_tokens_zho:.2f}",
+                "adjusted_seen_tokens_total": f"{tracker.adjusted_seen_tokens_total:.2f}",
+                "stage_target_adjusted_tokens": (
+                    f"{target_adjusted_tokens:.0f}"
+                    if target_adjusted_tokens is not None
+                    else ""
+                ),
+                "checkpoint_path": checkpoint_path,
+            })
+            f.flush()
+            return checkpoint_path
+
         completed_stages = 0
         last_stage_checkpoint_path = ""
 
@@ -795,7 +872,6 @@ def train_model_curriculum(
                 if target_adjusted_tokens is not None
                 else None
             )
-            stage_checkpoint_name = stage.get("checkpoint_name", stage_name)
             stage_step = 0
             stage_finished = False
 
@@ -830,6 +906,30 @@ def train_model_curriculum(
                         language_ids=language_ids,
                     )
                     current_adjusted_total = tracker.adjusted_seen_tokens_total
+                    if save_intermediate_checkpoints:
+                        while (
+                            next_checkpoint_target is not None
+                            and current_adjusted_total + batch_adjusted_delta
+                            > next_checkpoint_target
+                        ):
+                            write_curriculum_milestone_checkpoint_row(
+                                checkpoint_target=next_checkpoint_target,
+                                epoch=last_epoch if last_epoch is not None else epoch,
+                                stage_name=(
+                                    last_stage_name
+                                    if last_stage_name is not None
+                                    else stage_name
+                                ),
+                                stage_step=last_stage_step,
+                                micro_train_loss=last_micro_train_loss,
+                                update_train_loss_avg=last_update_train_loss_avg,
+                                target_adjusted_tokens=last_target_adjusted_tokens,
+                            )
+                            next_checkpoint_target = get_next_checkpoint_target(
+                                next_checkpoint_target,
+                                checkpoint_interval_for_schedule,
+                            )
+
                     would_exceed_stage = (
                         target_adjusted_tokens is not None
                         and current_adjusted_total + batch_adjusted_delta
@@ -857,9 +957,9 @@ def train_model_curriculum(
                             f"batch_delta={batch_adjusted_delta:.2f})"
                         )
 
-                        checkpoint_name = stage_checkpoint_name
-                        if would_exceed_global or is_last_stage:
-                            checkpoint_name = "final_model"
+                        checkpoint_name = "final_model" if (
+                            would_exceed_global or is_last_stage
+                        ) else ""
 
                         if last_micro_train_loss is not None:
                             checkpoint_path = write_curriculum_checkpoint_row(
@@ -873,12 +973,14 @@ def train_model_curriculum(
                                 checkpoint_name=checkpoint_name,
                             )
                         else:
-                            checkpoint_path = save_checkpoint(
-                                model=model,
-                                tokenizer=tokenizer,
-                                output_dir=output_dir,
-                                checkpoint_name=checkpoint_name,
-                            )
+                            checkpoint_path = ""
+                            if checkpoint_name:
+                                checkpoint_path = save_checkpoint(
+                                    model=model,
+                                    tokenizer=tokenizer,
+                                    output_dir=output_dir,
+                                    checkpoint_name=checkpoint_name,
+                                )
 
                         stage_finished = True
                         if checkpoint_path:
@@ -939,6 +1041,25 @@ def train_model_curriculum(
                         global_step += 1
                         stage_step += 1
                         accumulated_micro_steps = 0
+
+                    if save_intermediate_checkpoints:
+                        while (
+                            next_checkpoint_target is not None
+                            and adjusted_total >= next_checkpoint_target
+                        ):
+                            write_curriculum_milestone_checkpoint_row(
+                                checkpoint_target=next_checkpoint_target,
+                                epoch=epoch,
+                                stage_name=stage_name,
+                                stage_step=stage_step,
+                                micro_train_loss=micro_train_loss,
+                                update_train_loss_avg=update_train_loss_avg,
+                                target_adjusted_tokens=target_adjusted_tokens,
+                            )
+                            next_checkpoint_target = get_next_checkpoint_target(
+                                next_checkpoint_target,
+                                checkpoint_interval_for_schedule,
+                            )
 
                     validation_loss = ""
                     perplexity = ""
@@ -1026,11 +1147,7 @@ def train_model_curriculum(
                         target_adjusted_tokens is not None
                         and adjusted_total >= target_adjusted_tokens
                     ):
-                        checkpoint_name = stage_checkpoint_name
-                        if not save_intermediate_checkpoints:
-                            checkpoint_name = (
-                                "final_model" if is_last_stage else stage_checkpoint_name
-                            )
+                        checkpoint_name = "final_model" if is_last_stage else ""
                         checkpoint_path = write_curriculum_checkpoint_row(
                             epoch=epoch,
                             stage_name=stage_name,
