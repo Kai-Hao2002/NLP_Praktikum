@@ -23,7 +23,7 @@ from transformers import PreTrainedTokenizerFast
 BYTE_PREMIUM = {
     "eng": 1.0,
     "nld": 1.0516,
-    "zho": 0.9894,
+    "zho": 0.93,
 }
 
 
