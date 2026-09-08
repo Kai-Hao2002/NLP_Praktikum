@@ -138,7 +138,7 @@ def calculate_adjusted_tokens(target_tokens, lang):
     """
     Calculate actual allowed sampling tokens adjusted by Byte Premium
     """
-    premiums = {'eng': 1.0, 'nld': 1.0516, 'zho': 0.9894}
+    premiums = {'eng': 1.0, 'nld': 1.0516, 'zho': 0.93}
     # 公式: 實際抽取量 = 目標預算 / 溢價係數
     # Formula: Actual sampled = Target budget / Premium factor
     return int(target_tokens / premiums[lang])
